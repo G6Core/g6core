@@ -2,8 +2,78 @@
 
 **Beyond the Game. Beyond Limits.**
 
-Next-generation GTA 6 modding & multiplayer.
+An independent project building a platform for GTA 6 modding and multiplayer. The PC port comes first; custom servers, modding tools and developer APIs build on it.
 
-🚧 Public development updates coming soon.
+[Website and live roadmap](https://g6core.com) · [X](https://x.com/G6Core) · [Discord](https://discord.gg/g6core)
 
-**Stay tuned.**
+> **Modified version, 2026-11-25.** G6 Runtime is derived from earlier GPL-3.0-or-later work and remains under that licence. Authors, origins and changes are listed in [CREDITS.md](CREDITS.md).
+
+## Status
+
+**Early development. Performance and stability have not been validated.** They are objectives, not current achievements. Milestones are published on the [live roadmap](https://g6core.com/#roadmap).
+
+| Phase | Goal |
+|-------|------|
+| 1 | PC porting and initial boot (in progress) |
+| 2 | Core development |
+| 3 | Developer tools |
+| 4 | Multiplayer platform |
+| 5 | Public release |
+
+## What is in this repository
+
+G6 Runtime is a Windows x64 compatibility runtime. It runs the Xbox Series executable of your own game installation and translates its GPU work to Direct3D 12.
+
+**No game files, code or assets are included, and none are distributed. The Xbox build is not provided: you must have your own.** Shaders are translated on your computer, and saves and shader caches stay there.
+
+## Requirements
+
+- 64-bit Windows and a current Direct3D 12 driver, with mesh shaders and Shader Model 6.6
+- A large Windows commit limit: set a bigger page file if your computer has 32 GB of RAM or less
+- [Rust](https://rustup.rs/) (the version is pinned in `rust-toolchain.toml`)
+- [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with **Desktop development with C++**, including the x64 MSVC toolset and a Windows 10 or 11 SDK
+- A controller for the game's first-time setup
+
+## Build and run
+
+1. In the source folder, run **Setup.cmd** and select the game executable inside your own installation. Keep its accompanying files together. From PowerShell:
+
+   ```powershell
+   .\Setup.cmd -GamePath "D:\My Games\Series X\game_scarlett_master.exe"
+   ```
+
+   Setup verifies the BCPack format tables, builds the programs and installs them in `%LOCALAPPDATA%\G6 Runtime`.
+
+2. Recommended: run `g6-warm.exe` from that folder to translate shaders ahead of time. This takes several minutes, and has to be done again after the shader translator changes.
+3. Open **G6 Runtime** from the Start menu. Logs are in `logs`; `logs\latest.txt` names the latest one.
+
+**G6 Runtime (Experimental RT)** starts the game with ray tracing enabled. It is unfinished and can be very slow. See the [ray-tracing notes](docs/fork-ray-tracing.md).
+
+## NVIDIA graphics cards
+
+The console runs some programs in groups of 64 lanes; NVIDIA cards run 32. The translator rewrites those programs, and detects the card by itself.
+
+Development machine: NVIDIA RTX 2000 Ada (16 GB), driver 621.40. The automated tests and shader translation run there. In-game behaviour on this card has not been verified yet.
+
+Known limitations on 32-lane cards:
+
+- A few compute shaders still cannot be translated or are refused by the driver, so some effects can be missing. Most need thread groups spanning several 64-lane waves; others belong to the ray-tracing structure builder.
+- Programs that have no other 32-lane form use wave-wide branches as a last resort. This form has caused the graphics device to be lost in earlier testing. Set `G6_WAVE_WIDE=0` to leave those programs out; shaders are then translated again.
+- Overlapping pixels are not ordered for the shaders that ask for it, which can cause visual artefacts.
+
+## Development
+
+```powershell
+.\Initialize-FormatTables.ps1
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo xtask install-hooks        # asset-policy check on every commit
+```
+
+Configuration is described in [g6.example.toml](g6.example.toml). Nothing from the game or any other proprietary source may be committed: see the [asset policy](docs/asset-policy.md).
+
+## Licence and credits
+
+G6 source is licensed under [GPL-3.0-or-later](LICENSE). Authors, origins, contributions and references are listed in [CREDITS.md](CREDITS.md). The BCPack format tables are supplied separately, outside that licence; the setup script downloads and verifies them.
+
+G6Core is an independent project and is not affiliated with, endorsed by, or sponsored by Rockstar Games or Take-Two Interactive.
