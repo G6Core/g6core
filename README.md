@@ -10,7 +10,18 @@ An independent project building a platform for GTA 6 modding and multiplayer. Th
 
 ## Status
 
-**Early development. Performance and stability have not been validated.** They are objectives, not current achievements. Milestones are published on the [live roadmap](https://g6core.com/#roadmap).
+**Early development: the game runs, but it is not playable yet.** Performance and stability are objectives, not current achievements. Milestones are published on the [live roadmap](https://g6core.com/#roadmap).
+
+First in-game tests, 2026-11-25, on one development machine (NVIDIA RTX 2000 Ada, 16 GB of RAM, 4K display mode):
+
+| Area | State |
+|------|-------|
+| Boot and first-time setup screens | work, about 30 fps |
+| Story scenes and first missions | start and are displayed |
+| Controls | respond |
+| Frame rate in game | about 2 to 4 fps; 2.5 fps on average in the last minutes measured |
+| Rendering | incomplete: some elements are missing |
+| Stability | one crash at the first story scene, then a 21-minute session without one after the setting described below |
 
 | Phase | Goal |
 |-------|------|
@@ -32,7 +43,8 @@ G6 Runtime is a Windows x64 compatibility runtime. It runs the Xbox Series execu
 - A large Windows commit limit: set a bigger page file if your computer has 32 GB of RAM or less
 - [Rust](https://rustup.rs/) (the version is pinned in `rust-toolchain.toml`)
 - [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with **Desktop development with C++**, including the x64 MSVC toolset and a Windows 10 or 11 SDK
-- A controller for the game's first-time setup
+- A controller for the game's first-time setup: an Xbox-type (XInput) pad, or a DualSense connected over USB. On a cloud PC, a PlayStation pad may need to be presented as an Xbox pad. Without a recognised pad, the keyboard stands in: Enter is A, Backspace is B, the arrows are the D-pad, Esc is Menu
+- About 28 GB of memory was committed during play, so the page file matters
 
 ## Build and run
 
@@ -47,13 +59,23 @@ G6 Runtime is a Windows x64 compatibility runtime. It runs the Xbox Series execu
 2. Recommended: run `g6-warm.exe` from that folder to translate shaders ahead of time. This takes several minutes, and has to be done again after the shader translator changes.
 3. Open **G6 Runtime** from the Start menu. Logs are in `logs`; `logs\latest.txt` names the latest one.
 
+### If the game stops at the first story scene
+
+While pipelines are still being compiled, a frame can take longer than the game tolerates, and it ends itself (exit code `0xc0000005`). Shorten the time each frame waits for them, then start the game again:
+
+```powershell
+[Environment]::SetEnvironmentVariable('G6_PIPELINE_WAIT_MS', '2000', 'User')
+```
+
+Some objects may then be missing or appear late. Compiled pipelines are kept, so later runs wait less. Remove the variable to restore the default.
+
 **G6 Runtime (Experimental RT)** starts the game with ray tracing enabled. It is unfinished and can be very slow. See the [ray-tracing notes](docs/fork-ray-tracing.md).
 
 ## NVIDIA graphics cards
 
 The console runs some programs in groups of 64 lanes; NVIDIA cards run 32. The translator rewrites those programs, and detects the card by itself.
 
-Development machine: NVIDIA RTX 2000 Ada (16 GB), driver 621.40. The automated tests and shader translation run there. In-game behaviour on this card has not been verified yet.
+Development machine: NVIDIA RTX 2000 Ada (16 GB), driver 621.40. The automated tests, shader translation and the first in-game sessions run there. No loss of the graphics device was logged in those sessions.
 
 Known limitations on 32-lane cards:
 
