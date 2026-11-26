@@ -64,6 +64,7 @@ translation_inputs! {
     "emit/lower.rs",
     "emit/mod.rs",
     "emit/own_bits.rs",
+    "emit/packed.rs",
     "emit/packed_mask.rs",
     "emit/rect.rs",
     "emit/sampler.rs",

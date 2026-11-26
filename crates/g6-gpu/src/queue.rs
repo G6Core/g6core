@@ -592,6 +592,63 @@ pub(crate) struct Plane {
     count: u32,
     resources: *const This,
 }
+/// A present plane as `PresentX` has it: the common start, then pointers to
+/// source rectangles and a destination, a colour space and seven option
+/// words. Callers of one plane pass the start alone.
+#[cfg(windows)]
+#[repr(C)]
+struct WholePlane {
+    start: Plane,
+    source_rects: *const (),
+    destination: *const (),
+    color_space: u32,
+    options: [u32; 7],
+}
+#[cfg(windows)]
+const _: () = assert!(size_of::<WholePlane>() == 72);
+
+/// The first resource of the second plane, if it is one of ours. Only that
+/// plane's start is read, so a caller with another layout still gets its
+/// first plane shown.
+#[cfg(windows)]
+fn second_plane(parameters: *const Plane) -> Option<This> {
+    let second = parameters.cast::<WholePlane>().wrapping_add(1).cast::<u8>();
+    let mut start = [0; size_of::<Plane>()];
+    if !crate::host::read_into(second, &mut start) {
+        return None;
+    }
+    // SAFETY: the bytes just copied, in the plane's C layout.
+    let plane = unsafe { start.as_ptr().cast::<Plane>().read_unaligned() };
+    let mut pointer = [0; size_of::<This>()];
+    if plane.count == 0
+        || plane.resources.is_null()
+        || !crate::host::read_into(plane.resources.cast(), &mut pointer)
+    {
+        return None;
+    }
+    let resource = usize::from_ne_bytes(pointer) as This;
+    crate::resource::is_resource(resource).then_some(resource)
+}
+
+/// Whether the second plane of a present of `planes` is shown over the first
+/// ([`crate::compose::on`]). Says once that the title presents more than one
+/// and what the second is.
+#[cfg(windows)]
+fn planes_seen(planes: u32, parameters: *const Plane) -> bool {
+    static ONCE: AtomicBool = AtomicBool::new(false);
+    let on = crate::compose::on();
+    if !ONCE.swap(true, Ordering::Relaxed) {
+        let second = second_plane(parameters);
+        tracing::info!(
+            planes,
+            second = ?second,
+            second_known = second.is_some_and(|r| crate::resource::host_resource(r).is_some()),
+            composed = on,
+            "the title presents more than one plane (G6_PLANES=0 shows the first alone)"
+        );
+    }
+    on
+}
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
@@ -750,10 +807,11 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
-/// Shows the first plane's first resource in our window.
+/// Shows the first plane's first resource in our window, with a second
+/// plane's composed over it ([`crate::compose`]).
 ///
-/// shortcut: one plane, no scaling or placement, the source expected in
-/// the common state.
+/// shortcut: two planes at most, each stretched to the first one's size (no
+/// source rectangle or placement), the sources expected in the common state.
 extern "system" fn present(
     _: This,
     planes: u32,
@@ -828,8 +886,27 @@ extern "system" fn present(
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
+        let overlay = (planes > 1 && planes_seen(planes, plane_parameters))
+            .then(|| second_plane(plane_parameters))
+            .flatten()
+            .filter(|&over| over != resource)
+            .and_then(|over| {
+                crate::resource::host_resource(over).map(|texture| {
+                    let state = crate::resource::host_transition(over, COPY_SOURCE)
+                        .map_or(COPY_SOURCE, |(_, before)| before);
+                    (over, texture, state)
+                })
+            });
+        let shown = host.present_planes(
+            texture,
+            state,
+            overlay.map(|(_, texture, state)| (texture, state)),
+            frame,
+        );
         crate::resource::host_transition(resource, state);
+        if let Some((over, _, state)) = overlay {
+            crate::resource::host_transition(over, state);
+        }
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);
         #[cfg(not(feature = "diagnostics"))]

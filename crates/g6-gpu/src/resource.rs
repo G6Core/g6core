@@ -245,19 +245,21 @@ pub(crate) fn pc_format(format: u32) -> u32 {
 /// nothing. There 8-bit RGBA stands in: the same channels in the same
 /// order, every 4-bit level exact and every 5-bit level within 1/510.
 /// The title's pipelines and views of such targets name the stand-in too
-/// ([`view_format`], the host view checks).
+/// ([`view_format`], the host view checks). On Series S the title also
+/// asks for a full-screen R9G9B9E5 (67) target, which NVIDIA refuses:
+/// 16-bit float RGBA (10) holds every one of its values exactly.
 /// shortcut: copies between such a target and a texture the title fills
-/// itself in the 16-bit format are skipped ([`stands_in`]); convert them
+/// itself in its own format are skipped ([`stands_in`]); convert them
 /// if a pass turns out to need one.
 pub(crate) fn target_format(format: u32) -> u32 {
-    const STAND_INS: [(u32, u32); 2] = [(86, 28), (115, 28)];
+    const STAND_INS: [(u32, u32); 3] = [(86, 28), (115, 28), (67, 10)];
     let Some(i) = STAND_INS.iter().position(|&(f, _)| f == format) else {
         return format;
     };
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::*;
-        static REFUSED: std::sync::OnceLock<[bool; 2]> = std::sync::OnceLock::new();
+        static REFUSED: std::sync::OnceLock<[bool; 3]> = std::sync::OnceLock::new();
         let refused = REFUSED.get_or_init(|| {
             STAND_INS.map(|(f, _)| {
                 let Some(host) = crate::host::host() else {
@@ -279,7 +281,7 @@ pub(crate) fn target_format(format: u32) -> u32 {
                     | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
                 let refused = asked.is_err() || support.Support1.0 & both != both;
                 if refused {
-                    tracing::info!(format = f, "the host does not render to this format: 8-bit RGBA stands in");
+                    tracing::info!(format = f, "the host does not render to this format: another format stands in");
                 }
                 refused
             })
@@ -1829,6 +1831,14 @@ pub(crate) fn placed_textures() -> u64 {
     PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner()).len() as u64
 }
 
+/// Whether `this` is a title resource of ours: safe to ask of any pointer.
+#[cfg(windows)]
+pub(crate) fn is_resource(this: This) -> bool {
+    let mut table = [0; size_of::<usize>()];
+    crate::host::read_into(this.cast(), &mut table)
+        && usize::from_ne_bytes(table) == RESOURCE_FUNCTIONS.0.as_ptr() as usize
+}
+
 /// Moves the host texture to `wanted` (a host texture state); the host
 /// resource and the state it leaves, if that is a change.
 #[cfg(windows)]
@@ -2737,6 +2747,18 @@ mod tests {
             S_OK
         );
         heap
+    }
+
+    /// The Series S title asks for a full-screen R9G9B9E5 target: it gets
+    /// a host copy, in that format if the card takes it, else its stand-in.
+    #[cfg(windows)]
+    #[test]
+    fn a_shared_exponent_target_gets_a_host_texture() {
+        const TARGET_UNORDERED: u32 = 5;
+        let desc = ResourceDesc { flags: TARGET_UNORDERED, ..texture(1920, 1080, 67, 1) };
+        let made = host_texture(&desc, 0, std::ptr::null()).expect("no host texture");
+        // SAFETY: a live resource.
+        assert_eq!(unsafe { made.GetDesc() }.Format.0 as u32, target_format(67));
     }
 
     #[test]

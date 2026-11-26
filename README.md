@@ -25,6 +25,16 @@ First in-game tests, 2026-11-25, on one development machine (NVIDIA RTX 2000 Ada
 | Rendering | incomplete: some elements are missing |
 | Stability | one crash at the first story scene, then a 21-minute session without one after the setting described below |
 
+Series S mode, 2026-11-26, same machine, 1920×1080 output:
+
+| Area | State |
+|------|-------|
+| Start screen and first story scene | displayed |
+| The AMD upscaler's precompiled programs | all 29 translate |
+| Frame rate in game | median 3.3 fps in a hand-played session, with drops below 1 fps |
+| Stability | a hand-played session of about 13 minutes and an automated run of about 10 minutes, with no error logged |
+| Memory | about 22 GB committed |
+
 | Phase | Goal |
 |-------|------|
 | 1 | PC porting and initial boot (in progress) |
@@ -60,6 +70,22 @@ G6 Runtime is a Windows x64 compatibility runtime. It runs the Xbox Series execu
 
 2. Recommended: run `g6-warm.exe` from that folder to translate shaders ahead of time. This takes several minutes, and has to be done again after the shader translator changes.
 3. Open **G6 Runtime** from the Start menu. Logs are in `logs`; `logs\latest.txt` names the latest one.
+
+### Series S mode
+
+The Start menu shortcuts use the Series X mode. To start the Series S mode at 1920×1080, after Setup:
+
+```powershell
+$env:G6_DISPLAY_MODE = '1920x1080'
+Set-Location "$env:LOCALAPPDATA\G6 Runtime"
+.\g6.exe run "D:\My Games\Series X\game_scarlett_master.exe" --execute --console series-s --unimplemented trap
+```
+
+It was tested on a copy of the saves without the Series X settings file. To keep your Series X saves and settings apart, set `G6_DATA_DIR` to another folder first.
+
+### Experimental: early fetching
+
+`G6_FETCH_AHEAD=on`, off by default, fetches some of the card's results before they are asked for. In one hand-played comparison in Series X mode the frame rate went from 2.45 to 3.1 fps, in a run that also had slightly fewer draws. It has not been measured in Series S mode.
 
 ### If the game stops at the first story scene
 

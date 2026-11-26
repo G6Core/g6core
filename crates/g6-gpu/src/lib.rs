@@ -15,19 +15,27 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
+#[cfg(windows)]
+mod ahead;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
+#[cfg(windows)]
+mod compose;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 #[cfg(windows)]
 mod debug_hud;
+#[cfg(windows)]
+mod disk;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
 pub mod fence;
+#[cfg(windows)]
+mod forecast;
 pub mod frame;
 #[cfg(windows)]
 mod host;

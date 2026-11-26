@@ -4,6 +4,8 @@ G6 Runtime is a modified version of earlier work released under GPL-3.0-or-later
 
 **Modified on 2026-11-25:** the names of the project, crates, programs, environment variables, folders and shortcuts were changed to G6. The historical upstream README was removed and its credits were gathered here. The format-table script now reads its source address from this file.
 
+**Modified on 2026-11-26:** changes for the Series S mode on NVIDIA cards, listed below.
+
 ## Where this code comes from
 
 - **VIctory**, by Marvisak and its contributors, is the original runtime and the base of everything here: the loader, the runtime services, the Direct3D 12 back end and the shader recompiler. GPL-3.0-or-later. [Marvisak/VIctory](https://github.com/Marvisak/VIctory)
@@ -18,6 +20,11 @@ G6 Runtime is a modified version of earlier work released under GPL-3.0-or-later
 - The second look at textures is fxceless's idea (victory-fork `a803c87`), written anew.
 - The loading waits in `crates/g6-gpu/src/pipeline/make.rs` are ported from `joshuu/victory-amd` commit `4436f8f1`.
 - The texture catch-up pace in `crates/g6-gpu/src/draw.rs` follows `joshuu/victory-amd`.
+- Series S support, ported on 2026-11-26 from [Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD) and adapted:
+  - reading the AMD upscaler's precompiled programs (`ACCC`), with the descriptor and instruction forms they need (commit `66afb2b`, which credits VIctory `0b35b7f`);
+  - parked scalars, "some lane is left" and one-channel counter stores (part of commit `389db9e`);
+  - one lane read after a whole-wave section (`wave.rs` and its use, part of commit `e5841a0`);
+  - two presented planes composed into one picture (commit `85a663d`, from codec-d/cool_fox by Graham, commits `641835a4` and `581b0cb9`).
 - Other parts were prompted by pull requests and issues of VIctory and victory-fork, with their code written anew.
 - Earlier forks report that their changes were developed with [Claude Code](https://claude.com/claude-code).
 
