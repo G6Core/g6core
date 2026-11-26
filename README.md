@@ -12,6 +12,8 @@ An independent project building a platform for GTA 6 modding and multiplayer. Th
 
 **Early development: the game runs, but it is not playable yet.** Performance and stability are objectives, not current achievements. Milestones are published on the [live roadmap](https://g6core.com/#roadmap).
 
+**How we publish:** we push to GitHub only once or twice a day. Rather than publishing every small change, as some projects do, we favour a push when there is a substantial improvement.
+
 First in-game tests, 2026-11-25, on one development machine (NVIDIA RTX 2000 Ada, 16 GB of RAM, 4K display mode):
 
 | Area | State |
