@@ -234,6 +234,40 @@ fn windows() -> bool {
     *ON.get_or_init(|| std::env::var_os("G6_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
 }
 
+/// Whether indirect draws of one record are clamped in groups
+/// (`crate::indirect::batch`; on by default, `G6_INDIRECT_BATCH=0` bounds
+/// each record by a pass of its own).
+///
+/// A frame of the Series S prison scene has about 4,600 indirect commands,
+/// each bounded by a pass of its own between two waits (measured
+/// 2026-11-27: about 26 ms of the card's time a frame with the state set
+/// again after), 94 % of the passes between two draws. Grouped, with the
+/// budget in the card's memory (`crate::host`), about 970 passes were left
+/// and the frame went from 230 to 157 ms, the picture unchanged there and in
+/// a hand-played start of the game (RTX 2000 Ada).
+///
+/// A group is opened by a draw's pass; the draws that follow read their
+/// records from the same pass, each exactly the record it asks for, while
+/// nothing can have changed it since the pass was recorded: only draws whose
+/// shaders store to no buffer take part, and a group ends at any dispatch,
+/// any draw whose shaders can store to a buffer, any copy, resolve or write
+/// of the title's, any barrier, pipeline sync or wait of the title's, and
+/// any other host list. The title must wait before it reads as arguments
+/// what it wrote, so the barriers alone should do; the rest is in case it
+/// has another way. What the title's processor changes is seen as before,
+/// at the next submission.
+pub(crate) fn batches() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("G6_INDIRECT_BATCH").is_none_or(|v| v != "0"))
+}
+
+/// The pass opened last ([`batches`]), while later draws may join it.
+struct Batch {
+    table: crate::indirect::batch::Table,
+    /// The buffer its bounded records lie in.
+    records: ID3D12Resource,
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -267,6 +301,11 @@ pub(crate) struct State {
     /// The indirect records clamped last, if later draws may still read
     /// them ([`windows`]).
     window: Option<Window>,
+    /// The grouped pass later draws may join ([`batches`]).
+    batch: Option<Batch>,
+    /// The title buffer copies grouped draws read records from lately (their
+    /// number and buffer), newest first: what the next pass can read too.
+    argument_copies: Vec<(u64, ID3D12Resource)>,
     /// What the host list has: pipeline, root signature, heaps.
     host_pipeline: usize,
     /// Graphics, compute.
@@ -308,6 +347,72 @@ impl State {
         } else {
             self.dynamic.push((heap, first, n));
         }
+    }
+
+    /// Something that can change title buffers, or order such changes, is
+    /// recorded: no later draw joins the open grouped pass ([`batches`]).
+    pub(crate) fn end_batch(&mut self) {
+        self.batch = None;
+    }
+
+    /// [`State::end_batch`] before a direct draw, unless the bound pipeline
+    /// is known to store to no buffer.
+    fn end_batch_if_storing(&mut self) {
+        if self.batch.is_some()
+            && crate::pipeline::host_pipeline(self.pipeline as This)
+                .is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores))
+        {
+            self.batch = None;
+        }
+    }
+
+    /// Where the bounded record of an indirect draw of `kind` at `arguments`
+    /// of the copy `args` will be: from the open pass, or from one recorded
+    /// now ([`batches`]). The buffer, the offset there, and whether a pass
+    /// was recorded. `None` if it cannot be bounded in a group.
+    fn batched(
+        &mut self,
+        list: &HostList,
+        args: &std::sync::Arc<crate::shadow::Shadow>,
+        arguments: u64,
+        kind: u32,
+    ) -> Option<(ID3D12Resource, u64, bool)> {
+        /// This list's first use since its reset or since it was made.
+        const BATCH_USE: usize = usize::MAX - 0x78;
+        if list.first_use(BATCH_USE) {
+            self.batch = None;
+            self.argument_copies.clear();
+        }
+        let (id, offset) = (args.id(), args.offset(arguments));
+        if let Some(open) = &mut self.batch
+            && let Some(at) = open.table.add(id, offset, kind)
+        {
+            return Some((open.records.clone(), at, false));
+        }
+        self.batch = None;
+        self.argument_copies.retain(|(known, _)| *known != id);
+        // Diagnostics: the pass marked in the list and timed
+        // (`crate::indirect::cost`).
+        #[cfg(feature = "diagnostics")]
+        let started = crate::indirect::cost::on().then(|| {
+            list.note_op(|| format!("clamp group {}", crate::indirect::cost::kind_name(kind)));
+            std::time::Instant::now()
+        });
+        let opened = crate::indirect::open_batch(list, (id, &args.buffer), &self.argument_copies);
+        self.argument_copies.insert(0, (id, args.buffer.clone()));
+        self.argument_copies.truncate(crate::indirect::batch::SOURCES);
+        let (mut table, records) = opened?;
+        // The pass left its own pipeline and compute roots.
+        self.host_pipeline = 0;
+        self.host_roots[1] = 0;
+        #[cfg(feature = "diagnostics")]
+        if let Some(started) = started {
+            crate::indirect::cost::pass(crate::indirect::cost::Part::Window, kind, 1, started);
+            list.note_op(|| "clamped state".to_owned());
+        }
+        let at = table.add(id, offset, kind)?;
+        self.batch = Some(Batch { table, records: records.clone() });
+        Some((records, at, true))
     }
 
     /// The list's submission has run (submissions are waited for): the
@@ -2224,6 +2329,7 @@ impl State {
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: Option<u32>) {
         // It may write the arguments a window holds clamped.
         self.window = None;
+        self.end_batch();
         let builder = crate::pipeline::is_builder(self.pipeline as This);
         #[cfg(feature = "diagnostics")]
         if builder {
@@ -2632,6 +2738,7 @@ impl State {
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         ATTEMPTS.fetch_add(1, Ordering::Relaxed);
         self.window = None;
+        self.end_batch_if_storing();
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = mesh_test() != 1
@@ -3037,6 +3144,7 @@ impl State {
     ) {
         ATTEMPTS.fetch_add(1, Ordering::Relaxed);
         self.window = None;
+        self.end_batch_if_storing();
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let ready = self.prepare(list, false);
@@ -3145,6 +3253,7 @@ impl State {
     ) {
         ATTEMPTS.fetch_add(1, Ordering::Relaxed);
         self.window = None;
+        self.end_batch_if_storing();
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         // Indexed rectangles are drawn by the rectangle geometry stage
@@ -3353,11 +3462,31 @@ impl State {
         } else {
             None
         };
-        let windowed = windows()
-            && kind != DISPATCH
-            && max == 1
-            && count.is_none()
-            && !p.stages.iter().any(|stage| stage.translated().stores);
+        // A command whose program can store to buffers, and any dispatch,
+        // ends the open group (`batches`) and takes no part in one.
+        let stores = p.stages.iter().any(|stage| stage.translated().stores);
+        if kind == DISPATCH || stores {
+            self.end_batch();
+        }
+        // A draw of one record: bounded in a group, its record in a slot of
+        // the group's buffer.
+        let grouped = if batches() && kind != DISPATCH && !stores && max == 1 && count.is_none() {
+            args.refresh(list, arguments, len);
+            self.batched(list, &args, arguments, kind)
+        } else {
+            None
+        };
+        let signature = if grouped.is_some() {
+            self.window = None;
+            let Some(slots) = host_signature(kind, crate::indirect::batch::SLOT) else {
+                why("no host signature for grouped records");
+                return false;
+            };
+            slots
+        } else {
+            signature
+        };
+        let windowed = grouped.is_none() && windows() && kind != DISPATCH && max == 1 && count.is_none() && !stores;
         // Another host list (a new one after a cut, or this one after its
         // reset) has another scratch buffer, or this one's with old bytes.
         if !windowed || list.first_use(WINDOW_USE) {
@@ -3370,7 +3499,10 @@ impl State {
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
             .map(|w| (w.scratch.clone(), offset - w.base));
-        let (bounded, at) = match hit {
+        // Diagnostics: whether a pass was recorded for this command.
+        #[cfg(feature = "diagnostics")]
+        let passed = grouped.as_ref().map_or(hit.is_none(), |g| g.2);
+        let (bounded, at) = match grouped.as_ref().map(|g| (g.0.clone(), g.1)).or(hit) {
             Some(hit) => hit,
             None => {
                 // A record a short step after the last window's last one
@@ -3402,6 +3534,13 @@ impl State {
                 // own and copies clamped active records into a scratch
                 // buffer at offset 0.
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+                // Diagnostics: the pass marked in the list and timed
+                // (`crate::indirect::cost`).
+                #[cfg(feature = "diagnostics")]
+                let started = crate::indirect::cost::on().then(|| {
+                    list.note_op(|| format!("clamp {} records {records}", crate::indirect::cost::kind_name(kind)));
+                    std::time::Instant::now()
+                });
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
                 let bounded = if parts.is_some() {
@@ -3411,6 +3550,19 @@ impl State {
                 } else {
                     crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
                 };
+                #[cfg(feature = "diagnostics")]
+                if let Some(started) = started {
+                    use crate::indirect::cost;
+                    let part = if parts.is_some() {
+                        cost::Part::Split
+                    } else if windowed && records > 1 {
+                        cost::Part::Window
+                    } else {
+                        cost::Part::Single
+                    };
+                    cost::pass(part, kind, records, started);
+                    list.note_op(|| "clamped state".to_owned());
+                }
                 let Some(bounded) = bounded else {
                     self.window = None;
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
@@ -3430,6 +3582,8 @@ impl State {
                 (bounded, 0)
             }
         };
+        #[cfg(feature = "diagnostics")]
+        let started = crate::indirect::cost::on().then(std::time::Instant::now);
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
@@ -3437,14 +3591,27 @@ impl State {
             DISPATCH => self.bind(list, p, false),
             _ => false,
         };
+        #[cfg(feature = "diagnostics")]
+        if let Some(started) = started {
+            use crate::indirect::cost;
+            cost::took(if passed { cost::Part::AfterPass } else { cost::Part::InWindow }, started);
+        }
         if !ran {
-            crate::indirect::done(list, &bounded);
+            // A group's buffer stays as it is for the draws that follow.
+            if grouped.is_none() {
+                crate::indirect::done(list, &bounded);
+            }
             why("prepare failed");
             return false;
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
-            self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
+            let word = match (crate::indirect::cost::on(), passed) {
+                (false, _) => "indirect",
+                (true, true) => "indirect+pass",
+                (true, false) => "indirect+window",
+            };
+            self.op_text(format!("{word} kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
         if kind == MESH {
             self.mesh_scissor(list, true);
@@ -3487,7 +3654,15 @@ impl State {
             let name = crate::pipeline::shaders_of(self.pipeline as This);
             crate::capture::read_indirect(list, crate::capture::Records::Clamped(&bounded, at), count, (kind, stride, max), name);
         }
-        crate::indirect::done(list, &bounded);
+        #[cfg(feature = "diagnostics")]
+        let started = crate::indirect::cost::on().then(std::time::Instant::now);
+        if grouped.is_none() {
+            crate::indirect::done(list, &bounded);
+        }
+        #[cfg(feature = "diagnostics")]
+        if let Some(started) = started {
+            crate::indirect::cost::took(crate::indirect::cost::Part::Done, started);
+        }
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {

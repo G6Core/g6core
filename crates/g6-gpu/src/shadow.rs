@@ -16,7 +16,7 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -94,6 +94,10 @@ struct Card {
     /// Offsets of the copy whose bytes changed on the CPU's side and have
     /// not gone to the card's side yet.
     dirty: Mutex<Vec<(usize, usize)>>,
+    /// Whether `dirty` holds ranges [`card_dirty`] has not taken: the one
+    /// thing it looks at for a copy with none. Shared with the copy's entry
+    /// in [`CARDED`]; set and cleared inside `dirty`'s lock.
+    changed: Arc<AtomicBool>,
     /// With [`relay`]: the offsets that went from `dirty` to the card's
     /// side, each with the number of the send that took it
     /// ([`card_dirty`]), kept until a fetch sent after it has been merged.
@@ -141,29 +145,52 @@ pub(crate) fn cards() -> bool {
 
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
-/// shaders write takes its size twice), both in bytes:
-/// `G6_CARD_BUFFERS_MIN_MB` (16) and `G6_CARD_BUFFERS_MB` (512).
-/// Run 69's gameplay has ten title buffers of 16 MiB or more, 494 MB, and
-/// 1,650 MB of the card's budget free.
+/// shaders write takes its size twice), both in bytes: every title buffer
+/// and 1,536 MB by default (`G6_CARD_BUFFERS_MB`);
+/// `G6_CARD_BUFFERS_MIN_KB` or `G6_CARD_BUFFERS_MIN_MB` set a floor.
+///
+/// The floor was 16 MiB, then 1 MiB (with the smaller buffers' shader writes
+/// found by the card's hashes, the first room's walls were drawn in every
+/// run). Under it a buffer stayed in the PC's memory and the card read and
+/// wrote it over the bus: one dispatch of the Series S prison scene that
+/// fills buffers of 160 and 640 KiB took 8.45 ms there and 0.03 ms on the
+/// card (RTX 2000 Ada, 2026-11-27). With every title buffer on the card the
+/// frame went from 251 to 230 ms for 0.3 GB more of the card's memory.
 fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
-        let mb = |name: &str, default: u64| {
-            std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default) << 20
-        };
-        // From 1 MiB up and 1,024 MB in all by default (it was 16 and 512):
-        // the shader writes of the smaller buffers are then found by the
-        // card's hashes too, and with that the first room's walls were
-        // drawn in every run.
-        (mb("G6_CARD_BUFFERS_MIN_MB", 1).max(1 << 20), mb("G6_CARD_BUFFERS_MB", 1024))
+        let set = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
+        (
+            least_on_card(set("G6_CARD_BUFFERS_MIN_KB"), set("G6_CARD_BUFFERS_MIN_MB")),
+            set("G6_CARD_BUFFERS_MB").unwrap_or(1536) << 20,
+        )
     })
+}
+
+/// The smallest copy size that goes to the card: `kb`
+/// (`G6_CARD_BUFFERS_MIN_KB`, 64 at least: copies are made in 64 KiB steps)
+/// where it is set, else `mb` (`G6_CARD_BUFFERS_MIN_MB`, 1 at least) where
+/// that is, else 64 KiB: every buffer.
+fn least_on_card(kb: Option<u64>, mb: Option<u64>) -> u64 {
+    match (kb, mb) {
+        (Some(kb), _) => kb.clamp(64, 1 << 20) << 10,
+        (None, Some(mb)) => mb.clamp(1, 1 << 10) << 20,
+        (None, None) => 64 << 10,
+    }
 }
 
 /// Bytes alive of copies' card sides, and of their "before" twins.
 static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
-/// The copies in the card's memory.
-static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
+/// The copies in the card's memory, each with its [`Card::changed`].
+static CARDED: Mutex<Vec<(std::sync::Weak<Shadow>, Arc<AtomicBool>)>> = Mutex::new(Vec::new());
+
+/// Adds a copy that has a side in the card's memory to [`CARDED`].
+fn list_carded(shadow: &Arc<Shadow>) {
+    if let Some(card) = &shadow.card {
+        CARDED.lock().unwrap_or_else(|e| e.into_inner()).push((Arc::downgrade(shadow), card.changed.clone()));
+    }
+}
 
 /// Since the last frame line: bytes copied to card sides and the ranges
 /// they were; pieces compared on the card, pieces fetched and their
@@ -177,7 +204,7 @@ pub(crate) fn card_stats() -> [u64; 10] {
     for (i, stat) in CARD_STATS.iter().enumerate() {
         out[i] = stat.swap(0, Ordering::Relaxed);
     }
-    out[7] = CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|w| w.strong_count() > 0).count() as u64;
+    out[7] = CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|w| w.0.strong_count() > 0).count() as u64;
     out[8] = CARD_BYTES[0].load(Ordering::Relaxed) + WINDOW_CARD_BYTES.load(Ordering::Relaxed);
     out[9] = CARD_BYTES[1].load(Ordering::Relaxed);
     out
@@ -297,7 +324,14 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
     let mut out = Vec::new();
     let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
-    carded.retain(|weak| {
+    // Every submission asks, and a frame of the prison scene has thousands
+    // of copies on the card of which a few hundred changed (taking each
+    // one's locks every time was 7 % of the submitting thread): a copy
+    // with nothing new is left at its flag.
+    carded.retain(|(weak, changed)| {
+        if !changed.load(Ordering::Acquire) {
+            return weak.strong_count() > 0;
+        }
         let Some(shadow) = weak.upgrade() else {
             return false;
         };
@@ -307,7 +341,10 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
             .map(|c| {
                 let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
                 let ranges = std::mem::take(&mut *dirty);
+                c.changed.store(false, Ordering::Release);
                 if relay() {
+                    // (Older notes than `fetched` are passed over by the
+                    // merge whether or not they are dropped here.)
                     let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
                     sent.retain(|s| s.2 > fetched);
                     sent.extend(ranges.iter().map(|&(a, b)| (a, b, sent_as)));
@@ -2649,6 +2686,7 @@ impl Shadow {
             Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
             _ => dirty.push((from, to)),
         }
+        card.changed.store(true, Ordering::Release);
     }
 
     /// Of a copy in the card's memory: the CPU's side (PC memory), the
@@ -3031,6 +3069,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     staging: buffer,
                     before: Mutex::default(),
                     dirty: Mutex::default(),
+                    changed: Arc::default(),
                     sent: Mutex::default(),
                     size,
                 };
@@ -3056,9 +3095,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
         shadow.card = card;
         let shadow = Arc::new(shadow);
-        if shadow.card.is_some() {
-            CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
-        }
+        list_carded(&shadow);
         entry.shadow = Some(shadow);
     }
     entry.shadow.clone()
@@ -3247,6 +3284,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 staging: buffer,
                 before: Mutex::default(),
                 dirty: Mutex::default(),
+                changed: Arc::default(),
                 sent: Mutex::default(),
                 size: len,
             };
@@ -3265,12 +3303,27 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     shadow.window = true;
     shadow.card = card;
     let shadow = Arc::new(shadow);
-    if shadow.card.is_some() {
-        CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
-    }
+    list_carded(&shadow);
     note(&shadow);
     map.insert((start, len), shadow.clone());
     Some(shadow)
+}
+
+#[cfg(test)]
+mod card_size_tests {
+    use super::least_on_card;
+
+    #[test]
+    fn every_buffer_goes_to_the_card_unless_a_floor_is_set() {
+        // By default down to the 64 KiB a copy takes at least.
+        assert_eq!(least_on_card(None, None), 64 << 10);
+        // A floor in MiB, 1 at least.
+        assert_eq!(least_on_card(None, Some(0)), 1 << 20);
+        assert_eq!(least_on_card(None, Some(16)), 16 << 20);
+        // A floor in KiB goes before it.
+        assert_eq!(least_on_card(Some(1), Some(16)), 64 << 10);
+        assert_eq!(least_on_card(Some(256), None), 256 << 10);
+    }
 }
 
 #[cfg(test)]

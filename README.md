@@ -35,6 +35,17 @@ Series S mode, 2026-11-26, same machine, 1920×1080 output:
 | Stability | a hand-played session of about 13 minutes and an automated run of about 10 minutes, with no error logged |
 | Memory | about 22 GB committed |
 
+Performance work of 2026-11-28, same machine, Series S mode, 1920×1080 output, automated runs in the prison scene at the start of the game. Each line adds to the one above; resolution and effects are unchanged:
+
+| Change | Time per frame | Frames per second |
+|--------|----------------|-------------------|
+| Before | 251 ms | 4.0 |
+| Every title buffer's copy in the card's memory | 230 ms | 4.3 |
+| Indirect draws bounded in groups, their budget in the card's memory | 157 ms | 6.4 |
+| Only the card copies that changed are looked at | 151 ms | 6.6 |
+
+Two runs of the same build differ by about 5 ms. A run of the published build, with nothing set, took 149 ms (6.7 fps). In Series X mode at the same output, one run each: 351 ms (2.9 fps) with the earlier behaviour and 225 ms (4.5 fps) with the new defaults; patchy light on a character's hair shows there with both. A hand-played session of the start of the game with these changes showed no visual defect to the player and logged no error, with a median of 5.7 fps in game. **It is still far from playable.** All three changes are on by default; to compare, or to go back: `G6_CARD_BUFFERS_MIN_MB=1` with `G6_CARD_BUFFERS_MB=1024`, `G6_CLAMP_BUDGET=pc` and `G6_INDIRECT_BATCH=0`. They have been tried on one NVIDIA card only.
+
 | Phase | Goal |
 |-------|------|
 | 1 | PC porting and initial boot (in progress) |
@@ -85,7 +96,7 @@ It was tested on a copy of the saves without the Series X settings file. To keep
 
 ### Experimental: early fetching
 
-`G6_FETCH_AHEAD=on`, off by default, fetches some of the card's results before they are asked for. In one hand-played comparison in Series X mode the frame rate went from 2.45 to 3.1 fps, in a run that also had slightly fewer draws. It has not been measured in Series S mode.
+`G6_FETCH_AHEAD=on`, off by default, fetches some of the card's results before they are asked for. In one hand-played comparison in Series X mode the frame rate went from 2.45 to 3.1 fps, in a run that also had slightly fewer draws. In alternated Series S runs on 2026-11-26 it gained about 1 %, less than two equal runs differ by, and black blocks on a character's hair showed in some captures with it (cause not established). Leave it off.
 
 ### If the game stops at the first story scene
 

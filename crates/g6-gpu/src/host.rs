@@ -857,6 +857,12 @@ pub(crate) struct HostList {
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// The buffer grouped argument passes write (`G6_INDIRECT_BATCH`,
+    /// [`HostList::batch_buffer`]), apart from [`HostList::indirect_scratch`]
+    /// so that a single pass between a group's draws leaves their records.
+    batch_args: OnceLock<Option<ID3D12Resource>>,
+    /// The budget in the card's memory instead ([`budget_on_card`]).
+    card_budget: OnceLock<Option<ID3D12Resource>>,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -940,6 +946,31 @@ fn record_preludes(plans: Vec<PlannedPrelude>) {
     crate::shadow::wide_run(jobs);
 }
 
+/// Whether the lists' indirect-work budget lives in the card's memory (the
+/// default) and not in the PC's (`G6_CLAMP_BUDGET=pc`). One clamp of one
+/// record does the same either way; a pass over many records has its
+/// threads take their share of the budget one after the other, each a trip
+/// over the bus in the PC's memory: on an RTX 2000 Ada a pass for 256 draws
+/// cost 6.1 microseconds a draw there and 0.2 on the card.
+fn budget_on_card() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("G6_CLAMP_BUDGET").map_or(true, |v| v != "pc"))
+}
+
+/// A buffer of zeros in upload memory, for what lists zero by a copy.
+fn zeros() -> Option<&'static ID3D12Resource> {
+    static ZEROS: OnceLock<Option<ID3D12Resource>> = OnceLock::new();
+    ZEROS
+        .get_or_init(|| {
+            let (buffer, data) = host()?.upload_buffer(256)?;
+            // SAFETY: the mapping of a fresh buffer of that many bytes.
+            unsafe { std::ptr::write_bytes(data, 0, 256) };
+            name(&buffer, || "zeros".to_owned());
+            Some(buffer)
+        })
+        .as_ref()
+}
+
 /// Single-list and repeated-list submissions use inline recording. A list
 /// owns one prelude allocator, so it cannot be reset by two workers.
 fn parallel_preludes(runs: &[&HostList]) -> bool {
@@ -963,8 +994,9 @@ fn lazy_prelude() -> bool {
 }
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
+/// (Room for the two more notes of each pass `G6_CLAMP_TIMING` marks.)
 #[cfg(feature = "diagnostics")]
-const STAMPS: u32 = 4096;
+const STAMPS: u32 = 16384;
 
 /// A marker's text and the host range its command reads (diagnostics).
 #[cfg(feature = "diagnostics")]
@@ -1835,6 +1867,9 @@ struct Deferred {
     texture_backs: Vec<crate::texback::Back>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+    /// Whether the list has recorded a grouped argument pass since its reset
+    /// ([`HostList::batch_buffer`]).
+    batch_used: bool,
     /// Work once the GPU has completed the list and its readbacks are visible.
     after: Vec<Box<dyn Fn() + Send>>,
 }
@@ -2434,6 +2469,34 @@ impl PendingWrites {
     }
 }
 
+/// With `G6_BLOCK_WHY=1` (diagnostics): a range a submission reads that a
+/// flight's shaders may write, which it therefore waits for: what reads it,
+/// the range, and the pending ranges it touches (the first, and how much of
+/// the title's memory they span in all).
+#[cfg(feature = "diagnostics")]
+fn block_why(written: &PendingWrites, reader: &str, from: usize, len: usize) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("G6_BLOCK_WHY").is_some()) {
+        return;
+    }
+    let to = from.saturating_add(len);
+    for (kind, ranges) in [("buffer", &written.buffers), ("texture", &written.textures)] {
+        let hits: Vec<_> = ranges.iter().filter(|r| r.0 < to && from < r.1).collect();
+        let Some(first) = hits.first() else {
+            continue;
+        };
+        tracing::info!(
+            reader,
+            kind,
+            read = format_args!("{from:#x}+{len:#x}"),
+            written = format_args!("{:#x}+{:#x}", first.0, first.1 - first.0),
+            ranges = hits.len(),
+            overlap = hits.iter().map(|r| r.1.min(to) - r.0.max(from)).sum::<usize>(),
+            "a submission waits for what it reads"
+        );
+    }
+}
+
 /// The first list whose CPU preparation would read a texture that an
 /// earlier list in this same batch still needs to publish.
 fn texture_dependency_cut(runs: &[&HostList]) -> Option<usize> {
@@ -2496,6 +2559,11 @@ fn blocked_by(written: &PendingWrites, runs: &[&HostList], count: bool) -> Optio
                     if written.touches(src, src + len) || written.touches(dst, dst + len) {
                         if count {
                             LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
+                            #[cfg(feature = "diagnostics")]
+                            {
+                                block_why(written, "copy source", src, len);
+                                block_why(written, "copy destination", dst, len);
+                            }
                         }
                         return Some(WHY_READ);
                     }
@@ -2504,6 +2572,10 @@ fn blocked_by(written: &PendingWrites, runs: &[&HostList], count: bool) -> Optio
                     if step.fills().iter().any(|f| written.touches(f.src, f.src.saturating_add(f.len))) {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
+                            #[cfg(feature = "diagnostics")]
+                            for f in step.fills() {
+                                block_why(written, "fill", f.src, f.len);
+                            }
                         }
                         return Some(WHY_READ);
                     }
@@ -3491,6 +3563,8 @@ impl Host {
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
+                batch_args: OnceLock::new(),
+                card_budget: OnceLock::new(),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -5743,9 +5817,14 @@ impl HostList {
         {
             let started = std::time::Instant::now();
             let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
-            if let Some((heap, _)) = self.stamps() && at < STAMPS - 1 {
-                // SAFETY: an open list and our query heap.
-                unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
+            if let Some((heap, _)) = self.stamps() {
+                if at < STAMPS - 1 {
+                    // SAFETY: an open list and our query heap.
+                    unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
+                } else if at == STAMPS - 1 {
+                    // Each such list, so that a log says when it happened.
+                    tracing::warn!(most = STAMPS, "a host list has more commands than timestamps: the rest are not timed apart");
+                }
             }
             let what = what();
             crate::capture::op(std::ptr::from_ref(self) as usize, || what.clone());
@@ -5933,6 +6012,9 @@ impl HostList {
     /// The host address of the list's indirect-work budget, zeroed at each
     /// submission of the list from the first use after a reset on.
     pub(crate) fn budget(&self) -> Option<u64> {
+        if budget_on_card() {
+            return self.budget_in_card_memory();
+        }
         let (buffer, data) = self
             .budget
             .get_or_init(|| {
@@ -5960,6 +6042,59 @@ impl HostList {
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
+    }
+
+    /// [`HostList::budget`] with the words in the card's memory
+    /// ([`budget_on_card`]): zeroed by a copy the list records at its first
+    /// use since its reset, so at each of its runs. The clamp's notes about
+    /// the last run (the largest group count asked for) stay on the card,
+    /// and the line that says them is left out.
+    fn budget_in_card_memory(&self) -> Option<u64> {
+        let buffer = self
+            .card_budget
+            .get_or_init(|| {
+                let buffer = host()?.uav_buffer(64 << 10)?;
+                name(&buffer, || "indirect work budget".to_owned());
+                Some(buffer)
+            })
+            .as_ref()?;
+        let zero = zeros()?;
+        let first = !std::mem::replace(&mut self.deferred().budget_zeroed, true);
+        if first {
+            // SAFETY: an open list; live buffers. The budget starts the list
+            // in the common state (every run's end decays it there), moves
+            // to the copy's destination implicitly and from there to the
+            // state the clamp writes it in.
+            unsafe {
+                self.list.CopyBufferRegion(buffer, 0, zero, 0, 256);
+                self.list.ResourceBarrier(&[transition(
+                    buffer,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+            }
+        }
+        // SAFETY: a live buffer.
+        Some(unsafe { buffer.GetGPUVirtualAddress() })
+    }
+
+    /// The list's buffer of `size` bytes (the same every time) for grouped
+    /// argument passes, and the state the next pass finds it in: the common
+    /// state at the list's first one since its reset (buffers decay to it
+    /// after every execution), the indirect argument state after.
+    pub(crate) fn batch_buffer(&self, size: u64) -> Option<(ID3D12Resource, D3D12_RESOURCE_STATES)> {
+        let buffer = self
+            .batch_args
+            .get_or_init(|| {
+                let buffer = host()?.uav_buffer(size.next_multiple_of(64 << 10))?;
+                name(&buffer, || "grouped indirect arguments".to_owned());
+                Some(buffer)
+            })
+            .clone()?;
+        let mut deferred = self.deferred();
+        let before = if deferred.batch_used { D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT } else { D3D12_RESOURCE_STATE_COMMON };
+        deferred.batch_used = true;
+        Some((buffer, before))
     }
 
     /// A device-local unordered-access buffer of at least `size` bytes for
@@ -6979,9 +7114,13 @@ impl Meter {
         let indirect = crate::list::take_indirect() as f64 / frames;
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
         let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
-        tracing::info!(
-            "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
-        );
+        // (Read from the budget's words only where they are in the PC's
+        // memory.)
+        if !budget_on_card() {
+            tracing::info!(
+                "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
+            );
+        }
         late_line(frames);
         card_clock_line(frames, ms);
         crate::shadow::back_line(frames);

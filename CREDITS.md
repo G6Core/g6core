@@ -25,6 +25,7 @@ G6 Runtime is a modified version of earlier work released under GPL-3.0-or-later
   - parked scalars, "some lane is left" and one-channel counter stores (part of commit `389db9e`);
   - one lane read after a whole-wave section (`wave.rs` and its use, part of commit `e5841a0`);
   - two presented planes composed into one picture (commit `85a663d`, from codec-d/cool_fox by Graham, commits `641835a4` and `581b0cb9`).
+- Grouped argument passes for indirect draws (on by default since 2026-11-28, `G6_INDIRECT_BATCH=0` turns them off), added on 2026-11-27, follow the idea of commit `ce3c03a` of [readmet3xt-lab/foxhound](https://github.com/readmet3xt-lab/foxhound) (GPL-3.0-or-later, read in [trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA)). The pass over a table of jobs filled while the list is recorded is theirs; the code is written anew around G6's own argument clamp (`crates/g6-gpu/src/indirect/batch.rs`).
 - Other parts were prompted by pull requests and issues of VIctory and victory-fork, with their code written anew.
 - Earlier forks report that their changes were developed with [Claude Code](https://claude.com/claude-code).
 

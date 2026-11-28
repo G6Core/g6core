@@ -1257,6 +1257,7 @@ pub(crate) fn log(frames: f64) {
         c[C::IndirectBounded as usize],
         barrier_test()
     );
+    crate::indirect::cost::log(frames);
     // What is compared after submissions, largest first, and how much of
     // it shaders had written.
     let compared = COMPARED.lock().unwrap_or_else(|e| e.into_inner()).take();
